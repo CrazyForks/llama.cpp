@@ -14059,6 +14059,21 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
                     int fd_flags = fcntl(sync_fd, F_GETFL);
                     GGML_LOG_DEBUG("ggml_vulkan: pre-import fd check: fd=%d fcntl(F_GETFL)=%d errno=%d\n",
                                    sync_fd, fd_flags, fd_flags == -1 ? errno : 0);
+
+                    // Read /proc/self/fdinfo to identify the fd type
+                    char fdinfo_path[64];
+                    snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/self/fdinfo/%d", sync_fd);
+                    FILE * f = fopen(fdinfo_path, "r");
+                    if (f) {
+                        char line[256];
+                        while (fgets(line, sizeof(line), f)) {
+                            // Remove trailing newline
+                            size_t len = strlen(line);
+                            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+                            GGML_LOG_DEBUG("ggml_vulkan: fdinfo: %s\n", line);
+                        }
+                        fclose(f);
+                    }
                 }
 #endif
 

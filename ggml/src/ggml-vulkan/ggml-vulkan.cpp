@@ -585,9 +585,8 @@ struct vk_peer_staging {
     size_t     host_size = 0;
     vk_buffer  src_buf;
     vk_buffer  dst_buf;
-    // sync_fd semaphores for GPU-only cross-device synchronization
-    vk::Semaphore src_sem;  // exportable binary semaphore on source device
-    vk::Semaphore dst_sem;  // importable binary semaphore on dest device
+    // sync_fd: exportable binary semaphore on source device (reusable after each export)
+    vk::Semaphore src_sem;
     bool use_sync_fd = false;
 };
 
@@ -888,9 +887,6 @@ struct vk_device_struct {
         for (auto& [peer, staging] : peer_staging) {
             if (staging.src_sem) {
                 device.destroySemaphore(staging.src_sem);
-            }
-            if (staging.dst_sem) {
-                peer->device.destroySemaphore(staging.dst_sem);
             }
             staging.src_buf.reset();
             staging.dst_buf.reset();
@@ -1911,7 +1907,7 @@ struct ggml_backend_vk_context {
 
     vk_device device;
 
-    size_t semaphore_idx, event_idx;
+    size_t semaphore_idx, binary_semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
@@ -2527,13 +2523,12 @@ static vk_context ggml_vk_create_temporary_context(vk_command_pool& p) {
 }
 
 static vk_semaphore * ggml_vk_create_binary_semaphore(ggml_backend_vk_context * ctx) {
-    VK_LOG_DEBUG("ggml_vk_create_timeline_semaphore()");
-    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eBinary, 0 };
-    vk::SemaphoreCreateInfo ci{};
-    ci.setPNext(&tci);
-    vk::Semaphore semaphore = ctx->device->device.createSemaphore(ci);
-    ctx->gc.semaphores.push_back({ semaphore, 0 });
-    return &ctx->gc.semaphores[ctx->gc.semaphores.size() - 1];
+    VK_LOG_DEBUG("ggml_vk_create_binary_semaphore()");
+    if (ctx->binary_semaphore_idx >= ctx->gc.semaphores.size()) {
+        vk::Semaphore semaphore = ctx->device->device.createSemaphore({});
+        ctx->gc.semaphores.push_back({ semaphore, 0 });
+    }
+    return &ctx->gc.semaphores[ctx->binary_semaphore_idx++];
 }
 
 static vk_semaphore * ggml_vk_create_timeline_semaphore(ggml_backend_vk_context * ctx) {
@@ -6035,6 +6030,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->device = ggml_vk_get_device(idx);
 
     ctx->semaphore_idx = 0;
+    ctx->binary_semaphore_idx = 0;
     ctx->event_idx = 0;
 
     ctx->prealloc_size_x = 0;
@@ -13382,10 +13378,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
         ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
     }
 
-    for (size_t i = 0; i < ctx->gc.semaphores.size(); i++) {
-        ctx->device->device.destroySemaphore({ ctx->gc.semaphores[i].s });
-    }
-    ctx->gc.semaphores.clear();
+    ctx->binary_semaphore_idx = 0;
 
     for (size_t i = 0; i < ctx->gc.tl_semaphores.size(); i++) {
         ctx->device->device.destroySemaphore({ ctx->gc.tl_semaphores[i].s });
@@ -13426,6 +13419,11 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+
+    for (auto& sem : ctx->gc.semaphores) {
+        ctx->device->device.destroySemaphore(sem.s);
+    }
+    ctx->gc.semaphores.clear();
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
@@ -13825,9 +13823,6 @@ static bool ggml_vk_ensure_peer_staging(vk_device& src_dev, vk_device& dst_dev, 
         if (it->second.src_sem) {
             src_dev->device.destroySemaphore(it->second.src_sem);
         }
-        if (it->second.dst_sem) {
-            dst_dev->device.destroySemaphore(it->second.dst_sem);
-        }
         it->second.src_buf.reset();
         it->second.dst_buf.reset();
         if (it->second.host_ptr) {
@@ -13881,20 +13876,17 @@ static bool ggml_vk_ensure_peer_staging(vk_device& src_dev, vk_device& dst_dev, 
         return false;
     }
 
-    vk::Semaphore src_sem{}, dst_sem{};
+    vk::Semaphore src_sem{};
     bool use_sync_fd = src_dev->external_semaphore_sync_fd && dst_dev->external_semaphore_sync_fd;
     if (use_sync_fd) {
         vk::ExportSemaphoreCreateInfo export_ci{ vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd };
         vk::SemaphoreCreateInfo sci{};
         sci.setPNext(&export_ci);
         src_sem = src_dev->device.createSemaphore(sci);
-
-        vk::SemaphoreCreateInfo dst_sci{};
-        dst_sem = dst_dev->device.createSemaphore(dst_sci);
     }
 
     src_dev->peer_staging[dst_dev.get()] = { host_ptr, alloc_size, src_buf, dst_buf,
-                                              src_sem, dst_sem, use_sync_fd };
+                                              src_sem, use_sync_fd };
     return true;
 }
 
@@ -13967,9 +13959,13 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
                 };
                 int sync_fd = src_dev->device.getSemaphoreFdKHR(get_fd_info);
 
+                // Each copy needs its own dest semaphore — multiple temporary
+                // imports before a wait would overwrite prior payloads
+                vk_semaphore * dst_sem = ggml_vk_create_binary_semaphore(ctx);
+
                 // Import sync_fd into destination semaphore
                 vk::ImportSemaphoreFdInfoKHR import_info{
-                    staging.dst_sem,
+                    dst_sem->s,
                     vk::SemaphoreImportFlagBits::eTemporary,
                     vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,
                     sync_fd
@@ -13977,7 +13973,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
                 dst_dev->device.importSemaphoreFdKHR(import_info);
 
                 // Destination waits on imported semaphore before hop2
-                dst_compute_ctx->s->wait_semaphores.push_back({ staging.dst_sem, 0 });
+                dst_compute_ctx->s->wait_semaphores.push_back({ dst_sem->s, 0 });
             } else {
                 // Tier 2: CPU fence fallback
                 // Submit hop1 with fence, wait for just this transfer

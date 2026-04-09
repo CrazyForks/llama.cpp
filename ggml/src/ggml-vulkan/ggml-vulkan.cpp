@@ -40,11 +40,6 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <future>
 #include <thread>
 
-#if !defined(_WIN32)
-#include <dirent.h>
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 
 #if defined(_MSC_VER)
 # define NOMINMAX 1
@@ -597,11 +592,7 @@ struct vk_peer_staging {
     std::vector<vk_peer_copy_buf> bufs;  // per-copy buffer pool
     size_t buf_idx = 0;                  // reset between iterations
 
-    // sync_fd path: exportable binary semaphore on source device
-    vk::Semaphore src_sem;
-    bool use_sync_fd = false;
-
-    // fence path: timeline semaphore on source device
+    // timeline semaphore on source device for hop1 synchronization
     vk::Semaphore tl_sem;
     uint64_t tl_sem_value = 0;
 };
@@ -617,7 +608,6 @@ struct vk_device_struct {
     uint64_t suballocation_block_size;
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
-    bool external_semaphore_sync_fd {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -901,9 +891,6 @@ struct vk_device_struct {
         device.destroyFence(fence);
 
         for (auto& [peer, staging] : peer_staging) {
-            if (staging.src_sem) {
-                device.destroySemaphore(staging.src_sem);
-            }
             if (staging.tl_sem) {
                 device.destroySemaphore(staging.tl_sem);
             }
@@ -1701,7 +1688,6 @@ typedef std::weak_ptr<vk_context_struct> vk_context_ref;
 
 struct ggml_vk_garbage_collector {
     std::vector<vk_semaphore> tl_semaphores;
-    std::vector<vk_semaphore> semaphores;
     std::vector<vk::Event> events;
     std::vector<vk_context> contexts;
 };
@@ -1928,7 +1914,7 @@ struct ggml_backend_vk_context {
 
     vk_device device;
 
-    size_t semaphore_idx, binary_semaphore_idx, event_idx;
+    size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
@@ -2543,14 +2529,6 @@ static vk_context ggml_vk_create_temporary_context(vk_command_pool& p) {
     return result;
 }
 
-static vk_semaphore * ggml_vk_create_binary_semaphore(ggml_backend_vk_context * ctx) {
-    VK_LOG_DEBUG("ggml_vk_create_binary_semaphore()");
-    if (ctx->binary_semaphore_idx >= ctx->gc.semaphores.size()) {
-        vk::Semaphore semaphore = ctx->device->device.createSemaphore({});
-        ctx->gc.semaphores.push_back({ semaphore, 0 });
-    }
-    return &ctx->gc.semaphores[ctx->binary_semaphore_idx++];
-}
 
 static vk_semaphore * ggml_vk_create_timeline_semaphore(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_create_timeline_semaphore()");
@@ -4931,8 +4909,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
-            } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
-                device->external_semaphore_sync_fd = true;
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -5230,22 +5206,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         if (device->external_memory_host) {
             device_extensions.push_back("VK_EXT_external_memory_host");
-        }
-
-        if (device->external_semaphore_sync_fd) {
-            // Verify SYNC_FD_BIT is actually supported for binary semaphores
-            vk::PhysicalDeviceExternalSemaphoreInfo sem_info{
-                vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd
-            };
-            vk::ExternalSemaphoreProperties sem_props =
-                device->physical_device.getExternalSemaphoreProperties(sem_info);
-            if ((sem_props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eExportable) &&
-                (sem_props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eImportable)) {
-                device_extensions.push_back("VK_KHR_external_semaphore_fd");
-                device_extensions.push_back("VK_KHR_external_semaphore");
-            } else {
-                device->external_semaphore_sync_fd = false;
-            }
         }
 
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -6051,7 +6011,6 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->device = ggml_vk_get_device(idx);
 
     ctx->semaphore_idx = 0;
-    ctx->binary_semaphore_idx = 0;
     ctx->event_idx = 0;
 
     ctx->prealloc_size_x = 0;
@@ -13399,41 +13358,12 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
         ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
     }
 
-    // Also reset device-level command pools used by cross-device hop1 temporary contexts
+    // Reset device-level command pools used by cross-device hop1 temporary contexts
     if (!ctx->device->peer_staging.empty()) {
         ggml_vk_queue_command_pools_cleanup(ctx->device);
     }
 
-    GGML_LOG_DEBUG("ggml_vulkan: graph_cleanup(%s) binary_semaphore_idx=%zu gc.semaphores=%zu\n",
-                   ctx->name.c_str(), ctx->binary_semaphore_idx, ctx->gc.semaphores.size());
-#if !defined(_WIN32)
-    if (!ctx->gc.semaphores.empty()) {
-        auto count_fds = []() -> int {
-            int n = 0;
-            DIR * d = opendir("/proc/self/fd");
-            if (d) { while (readdir(d)) n++; closedir(d); n -= 3; }
-            return n;
-        };
-        int fds_before = count_fds();
-        for (size_t i = 0; i < ctx->gc.semaphores.size(); i++) {
-            ctx->device->device.destroySemaphore(ctx->gc.semaphores[i].s);
-        }
-        int fds_after = count_fds();
-        GGML_LOG_DEBUG("ggml_vulkan: graph_cleanup destroyed %zu binary sems: fds %d -> %d (delta=%d)\n",
-                       ctx->gc.semaphores.size(), fds_before, fds_after, fds_after - fds_before);
-        ctx->gc.semaphores.clear();
-    }
-#else
-    for (size_t i = 0; i < ctx->gc.semaphores.size(); i++) {
-        ctx->device->device.destroySemaphore(ctx->gc.semaphores[i].s);
-    }
-    ctx->gc.semaphores.clear();
-#endif
-    ctx->binary_semaphore_idx = 0;
-
     for (auto& [peer, staging] : ctx->device->peer_staging) {
-        GGML_LOG_DEBUG("ggml_vulkan: graph_cleanup reset buf_idx %zu->0, tl_sem_value=%lu\n",
-                       staging.buf_idx, (unsigned long)staging.tl_sem_value);
         staging.buf_idx = 0;
     }
 
@@ -13476,11 +13406,6 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
-
-    for (auto& sem : ctx->gc.semaphores) {
-        ctx->device->device.destroySemaphore(sem.s);
-    }
-    ctx->gc.semaphores.clear();
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
@@ -13936,29 +13861,12 @@ static vk_peer_copy_buf * ggml_vk_get_peer_copy_buf(vk_device& src_dev, vk_devic
 
     auto& staging = src_dev->peer_staging[dst_dev.get()];
 
-    // Lazy-init semaphores on first use
-    if (!staging.src_sem && !staging.tl_sem) {
-        bool use_sync_fd = src_dev->external_semaphore_sync_fd && dst_dev->external_semaphore_sync_fd;
-        staging.use_sync_fd = use_sync_fd;
-
-        GGML_LOG_DEBUG("ggml_vulkan: peer_staging init: src=%s dst=%s use_sync_fd=%d\n",
-                       src_dev->name.c_str(), dst_dev->name.c_str(), (int)use_sync_fd);
-
-        if (use_sync_fd) {
-            vk::ExportSemaphoreCreateInfo export_ci{ vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd };
-            vk::SemaphoreCreateInfo sci{};
-            sci.setPNext(&export_ci);
-            staging.src_sem = src_dev->device.createSemaphore(sci);
-            GGML_LOG_DEBUG("ggml_vulkan: created exportable src_sem=%p on %s\n",
-                           (void *)(VkSemaphore)staging.src_sem, src_dev->name.c_str());
-        } else {
-            vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
-            vk::SemaphoreCreateInfo sci{};
-            sci.setPNext(&tci);
-            staging.tl_sem = src_dev->device.createSemaphore(sci);
-            GGML_LOG_DEBUG("ggml_vulkan: created timeline tl_sem=%p on %s\n",
-                           (void *)(VkSemaphore)staging.tl_sem, src_dev->name.c_str());
-        }
+    // Lazy-init timeline semaphore on first use
+    if (!staging.tl_sem) {
+        vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+        vk::SemaphoreCreateInfo sci{};
+        sci.setPNext(&tci);
+        staging.tl_sem = src_dev->device.createSemaphore(sci);
     }
 
     // Get or create a buffer from the pool
@@ -14016,18 +13924,12 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             size_t src_offset = vk_tensor_offset(src) + src->view_offs;
             size_t dst_offset = vk_tensor_offset(dst) + dst->view_offs;
 
-            GGML_LOG_DEBUG("ggml_vulkan: cross-device copy %s -> %s, nbytes=%zu\n",
-                           src_dev->name.c_str(), dst_dev->name.c_str(), nbytes);
-
             vk_peer_copy_buf * copy_buf = ggml_vk_get_peer_copy_buf(src_dev, dst_dev, nbytes);
             if (!copy_buf) {
-                GGML_LOG_DEBUG("ggml_vulkan: cross-device copy: failed to get peer copy buf\n");
                 return false;
             }
 
             auto& staging = src_dev->peer_staging[dst_dev.get()];
-            GGML_LOG_DEBUG("ggml_vulkan: cross-device copy: buf_idx=%zu/%zu use_sync_fd=%d\n",
-                           staging.buf_idx, staging.bufs.size(), (int)staging.use_sync_fd);
 
             // HOP 1: src VRAM → staging (on source compute queue)
             // Implicit queue submission ordering guarantees this
@@ -14047,99 +13949,22 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
                 ggml_vk_ctx_end(hop1_ctx);
             }
 
+            // Submit hop1, signal timeline semaphore, CPU wait
+            staging.tl_sem_value++;
+            hop1_ctx->seqs.back().back().signal_semaphores.push_back(
+                { staging.tl_sem, staging.tl_sem_value });
+            ggml_vk_submit(hop1_ctx, {});
+            src_ctx->submit_pending = true;
+
+            vk::SemaphoreWaitInfo swi{
+                vk::SemaphoreWaitFlags{},
+                1, &staging.tl_sem, &staging.tl_sem_value
+            };
+            VK_CHECK(src_dev->device.waitSemaphores(swi, UINT64_MAX),
+                     "cross_device_hop1 waitSemaphores");
+
             // HOP 2: staging → dst VRAM (on dest device)
             vk_context dst_compute_ctx = ggml_vk_get_compute_ctx(ctx);
-
-            if (staging.use_sync_fd) {
-                // Tier 1: GPU-only synchronization via sync_fd
-#if !defined(_WIN32)
-                auto count_fds = []() -> int {
-                    int n = 0;
-                    DIR * d = opendir("/proc/self/fd");
-                    if (d) { while (readdir(d)) n++; closedir(d); n -= 3; }
-                    return n;
-                };
-                int fds_before = count_fds();
-#endif
-
-                hop1_ctx->seqs.back().back().signal_semaphores.push_back({ staging.src_sem, 0 });
-                ggml_vk_submit(hop1_ctx, {});
-                src_ctx->submit_pending = true;
-
-#if !defined(_WIN32)
-                int fds_after_submit = count_fds();
-#endif
-
-                vk::SemaphoreGetFdInfoKHR get_fd_info{
-                    staging.src_sem,
-                    vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd
-                };
-                int sync_fd = src_dev->device.getSemaphoreFdKHR(get_fd_info);
-
-#if !defined(_WIN32)
-                int fds_after_export = count_fds();
-#endif
-
-                vk_semaphore * dst_sem = ggml_vk_create_binary_semaphore(ctx);
-
-#if !defined(_WIN32)
-                int fds_after_sem_create = count_fds();
-#endif
-
-                vk::ImportSemaphoreFdInfoKHR import_info{
-                    dst_sem->s,
-                    vk::SemaphoreImportFlagBits::eTemporary,
-                    vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,
-                    sync_fd
-                };
-
-                vk::Result import_result = dst_dev->device.importSemaphoreFdKHR(
-                    &import_info, VULKAN_HPP_DEFAULT_DISPATCHER);
-                if (import_result != vk::Result::eSuccess) {
-                    GGML_LOG_ERROR("ggml_vulkan: importSemaphoreFdKHR FAILED: result=%d fd=%d "
-                                   "dst_sem=%p src_dev=%s dst_dev=%s\n",
-                                   (int)import_result, sync_fd,
-                                   (void *)(VkSemaphore)dst_sem->s,
-                                   src_dev->name.c_str(), dst_dev->name.c_str());
-#if !defined(_WIN32)
-                    close(sync_fd);
-#endif
-                    return false;
-                }
-
-#if !defined(_WIN32)
-                int fds_after_import = count_fds();
-                if (sync_fd >= 0) {
-                    close(sync_fd);
-                }
-                int fds_after_close = count_fds();
-
-                GGML_LOG_DEBUG("ggml_vulkan: sync_fd fds: before=%d +submit=%d +export=%d "
-                               "+sem_create=%d +import=%d +close=%d\n",
-                               fds_before, fds_after_submit - fds_before,
-                               fds_after_export - fds_after_submit,
-                               fds_after_sem_create - fds_after_export,
-                               fds_after_import - fds_after_sem_create,
-                               fds_after_close - fds_after_import);
-#endif
-
-                dst_compute_ctx->s->wait_semaphores.push_back({ dst_sem->s, 0 });
-            } else {
-                // Tier 2: timeline semaphore with CPU wait
-                staging.tl_sem_value++;
-                hop1_ctx->seqs.back().back().signal_semaphores.push_back(
-                    { staging.tl_sem, staging.tl_sem_value });
-                ggml_vk_submit(hop1_ctx, {});
-                src_ctx->submit_pending = true;
-
-                // CPU wait for this hop1 to complete
-                vk::SemaphoreWaitInfo swi{
-                    vk::SemaphoreWaitFlags{},
-                    1, &staging.tl_sem, &staging.tl_sem_value
-                };
-                VK_CHECK(src_dev->device.waitSemaphores(swi, UINT64_MAX),
-                         "cross_device_hop1 waitSemaphores");
-            }
 
             VkBufferCopy bc2{ 0, dst_offset, nbytes };
             vkCmdCopyBuffer(dst_compute_ctx->s->buffer->buf,
@@ -14189,9 +14014,6 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
-    GGML_LOG_DEBUG("ggml_vulkan: synchronize(%s) submit_pending=%d compute_ctx_expired=%d\n",
-                   ctx->name.c_str(), (int)ctx->submit_pending,
-                   (int)ctx->compute_ctx.expired());
 
     bool do_transfer = !ctx->compute_ctx.expired();
 

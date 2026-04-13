@@ -89,6 +89,9 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q4_1_f32
     mul_mv_q4_1_f32_flat
     mul_mv_q4_k_f32
+    mul_mv_q4_k_f32_flat
+    mul_mv_q5_k_f32
+    mul_mv_q5_k_f32_flat
     mul_mv_q6_k_f32
     mul_mv_q6_k_f32_flat
     mul_mv_q8_0_f32
@@ -107,15 +110,22 @@ set(GGML_OPENCL_KERNELS
     mul_mm_q4_0_f32_l4_lm
     mul_mm_q4_1_f32_l4_lm
     mul_mm_q8_0_f32_l4_lm
+    mul_mm_q4_k_f32_l4_lm
+    mul_mm_q5_k_f32_l4_lm
     mul_mm_q6_k_f32_l4_lm
     mul_mm_q8_0_f32_8x4
     gemv_noshuffle_q4_1_f32
     gemm_noshuffle_q4_1_f32
     gemv_noshuffle_general_q8_0_f32
+    gemv_noshuffle_q4_k_f32
+    gemm_noshuffle_q4_k_f32
+    gemv_noshuffle_q6_k_f32
+    gemm_noshuffle_q6_k_f32
     mul
     neg
     norm
     relu
+    l2_norm
     rms_norm
     rope
     scale
@@ -131,6 +141,7 @@ set(GGML_OPENCL_KERNELS
     ssm_conv
     sub
     sum_rows
+    cumsum
     transpose
     concat
     tsembd

@@ -114,7 +114,8 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 MTMD_API void mtmd_free(mtmd_context * ctx);
 
 // whether we need to set non-causal mask before llama_decode
-MTMD_API bool mtmd_decode_use_non_causal(mtmd_context * ctx);
+// if chunk is nullptr, we assume the default case where chunk is an image chunk
+MTMD_API bool mtmd_decode_use_non_causal(mtmd_context * ctx, const mtmd_input_chunk * chunk);
 
 // whether the current model use M-RoPE for llama_decode
 MTMD_API bool mtmd_decode_use_mrope(mtmd_context * ctx);
@@ -125,9 +126,9 @@ MTMD_API bool mtmd_support_vision(mtmd_context * ctx);
 // whether the current model supports audio input
 MTMD_API bool mtmd_support_audio(mtmd_context * ctx);
 
-// get audio bitrate in Hz, for example 16000 for Whisper
+// get audio sample rate in Hz, for example 16000 for Whisper
 // return -1 if audio is not supported
-MTMD_API int mtmd_get_audio_bitrate(mtmd_context * ctx);
+MTMD_API int mtmd_get_audio_sample_rate(mtmd_context * ctx);
 
 // mtmd_bitmap
 //

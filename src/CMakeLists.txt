@@ -153,18 +153,27 @@ add_library(llama
 
 set_target_properties(llama PROPERTIES
     VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
+    SOVERSION ${LLAMA_VERSION_MAJOR}
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
+include(GenerateExportHeader)
+generate_export_header(llama
+    BASE_NAME LLAMA
+    EXPORT_MACRO_NAME LLAMA_API
+    NO_EXPORT_MACRO_NAME LLAMA_NO_EXPORT
+    EXPORT_FILE_NAME ${CMAKE_CURRENT_BINARY_DIR}/llama_export.h
+    STATIC_DEFINE LLAMA_STATIC_DEFINE)
+
 target_include_directories(llama PRIVATE .)
-target_include_directories(llama PUBLIC ../include)
+target_include_directories(llama PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_compile_definitions(llama PRIVATE LLAMA_BUILD)
-    target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()

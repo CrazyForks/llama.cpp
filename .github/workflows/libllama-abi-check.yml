@@ -1,0 +1,102 @@
+name: libllama ABI check
+
+# Checks exported symbols of libllama against a committed baseline and
+# determines whether a major (symbols removed/changed) or minor (symbols
+# added) version bump is required.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - 'include/llama.h'
+      - 'include/llama-cpp.h'
+      - 'src/**'
+      - 'scripts/libllama.abi'
+      - 'CMakeLists.txt'
+      - '.github/workflows/libllama-abi-check.yml'
+
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'include/llama.h'
+      - 'include/llama-cpp.h'
+      - 'src/**'
+      - 'scripts/libllama.abi'
+      - 'CMakeLists.txt'
+      - '.github/workflows/libllama-abi-check.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  abi-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DBUILD_SHARED_LIBS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_TOOLS_INSTALL=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_CUDA=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build libllama
+        run: cmake --build build --target llama -j$(nproc)
+
+      - name: Extract exported symbols
+        run: |
+          nm -D --format=posix build/bin/libllama.so \
+            | awk '$2 == "T" || $2 == "W" {print $1}' \
+            | grep '^llama_' \
+            | sort > /tmp/current.abi
+
+      - name: Compare with baseline
+        id: compare
+        run: |
+          baseline=scripts/libllama.abi
+          current=/tmp/current.abi
+
+          removed=$(comm -23 "$baseline" "$current")
+          added=$(comm -13 "$baseline" "$current")
+
+          if [ -n "$removed" ]; then
+            echo "bump=major" >> "$GITHUB_OUTPUT"
+            echo "### :boom: MAJOR version bump required" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The following exported symbols were **removed** from libllama:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "$removed" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$added" ]; then
+            echo "bump=minor" >> "$GITHUB_OUTPUT"
+            echo "### :sparkles: MINOR version bump required" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The following new symbols were **added** to libllama:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "$added" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+            echo "### :white_check_mark: No ABI change – PATCH version bump only" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -n "$removed" ] || [ -n "$added" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Update \`scripts/libllama.abi\` and increment \`LLAMA_VERSION_MAJOR\`/\`LLAMA_VERSION_MINOR\` in \`CMakeLists.txt\` accordingly." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fail on unacknowledged ABI break
+        if: steps.compare.outputs.bump == 'major' || steps.compare.outputs.bump == 'minor'
+        run: |
+          echo "ABI change detected. Update scripts/libllama.abi and bump LLAMA_VERSION_MAJOR/LLAMA_VERSION_MINOR in CMakeLists.txt."
+          exit 1

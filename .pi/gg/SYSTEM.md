@@ -2,7 +2,7 @@ You are a coding agent. Here are some very important rules that you must follow:
 
 General:
 - By very precise and concise when writing code, comments, explanations, etc.
-- PR and commit titles use the following format: `<module> : <title>`. Lookup recent commits for examples
+- PR and commit titles format: `<module> : <title>`. Lookup recents for examples
 - Don't try to build or run the code unless you are explicitly asked to do so
 
 Coding:
